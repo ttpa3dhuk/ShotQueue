@@ -196,6 +196,8 @@ private final class OverlayView: NSView {
     var mode: Mode = .select
     var selection: NSRect?
     var marks: [Mark] = []
+    private var redoMarks: [Mark] = []
+    private var selectedIndex: Int?
     var onFinish: ((NSRect, [Mark]) -> Void)?
     var onCancel: (() -> Void)?
     private var start: NSPoint?
@@ -245,6 +247,12 @@ private final class OverlayView: NSView {
             NSColor.systemBlue.setStroke()
             let border = NSBezierPath(rect: selection); border.lineWidth = 2; border.stroke()
             drawMarks(marks, letter: letter)
+            if let selectedIndex, marks.indices.contains(selectedIndex) {
+                let badge = badgePoint(for: marks[selectedIndex])
+                NSColor.white.setStroke()
+                let ring = NSBezierPath(ovalIn: NSRect(x: badge.x - 17, y: badge.y - 17, width: 34, height: 34))
+                ring.lineWidth = 2; ring.stroke()
+            }
         } else if let start, let current {
             let rect = rectBetween(start, current)
             displayImage.draw(in: rect, from: rect, operation: .copy, fraction: 1)
@@ -268,14 +276,30 @@ private final class OverlayView: NSView {
         NSRect(x: min(a.x, b.x), y: min(a.y, b.y), width: abs(a.x - b.x), height: abs(a.y - b.y))
     }
     private func point(_ event: NSEvent) -> NSPoint { convert(event.locationInWindow, from: nil) }
+    private func badgePoint(for mark: Mark) -> NSPoint {
+        if mark.kind == .rectangle {
+            return NSPoint(x: min(mark.x, mark.endX), y: max(mark.y, mark.endY))
+        }
+        return NSPoint(x: mark.x, y: mark.y)
+    }
 
     override func mouseDown(with event: NSEvent) {
         let p = point(event)
         if mode == .select { start = p; current = p; needsDisplay = true; return }
         guard selection?.contains(p) == true else { return }
         notePopup?.save()
+        if let existing = marks.indices.reversed().first(where: { index in
+            let badge = badgePoint(for: marks[index])
+            return hypot(badge.x - p.x, badge.y - p.y) < 17
+        }) {
+            selectedIndex = existing
+            editNote(index: existing, near: p)
+            needsDisplay = true
+            return
+        }
         if mode == .pin {
             marks.append(Mark(kind: .pin, x: p.x, y: p.y, endX: p.x, endY: p.y, note: ""))
+            redoMarks.removeAll(); selectedIndex = marks.count - 1
             editNote(index: marks.count - 1, near: p)
         } else { start = p; current = p }
         needsDisplay = true
@@ -301,23 +325,42 @@ private final class OverlayView: NSView {
                                  y: min(max(end.y, selection.minY), selection.maxY))
         let kind: MarkKind = mode == .rectangle ? .rectangle : .arrow
         marks.append(Mark(kind: kind, x: start.x, y: start.y, endX: clippedEnd.x, endY: clippedEnd.y, note: ""))
+        redoMarks.removeAll(); selectedIndex = marks.count - 1
         editNote(index: marks.count - 1, near: clippedEnd)
     }
 
     private func editNote(index: Int, near point: NSPoint) {
         guard let parent = window else { return }
         notePopup = NotePopup(parent: parent, letter: letter, number: index + 1,
-                              near: point, initial: marks[index].note) { [weak self] text in
+                              near: point, initial: marks[index].note,
+                              onSave: { [weak self] text in
             guard let self else { return }
             if self.marks.indices.contains(index) { self.marks[index].note = text }
             self.notePopup = nil
             parent.makeKeyAndOrderFront(nil)
             parent.makeFirstResponder(self)
             self.needsDisplay = true
-        }
+        }, onDelete: { [weak self] in
+            guard let self else { return }
+            if self.marks.indices.contains(index) { self.marks.remove(at: index) }
+            self.redoMarks.removeAll(); self.selectedIndex = nil; self.notePopup = nil
+            parent.makeKeyAndOrderFront(nil)
+            parent.makeFirstResponder(self)
+            self.needsDisplay = true
+        })
     }
 
     override func keyDown(with event: NSEvent) {
+        if event.keyCode == 6, event.modifierFlags.contains(.command) { // ⌘Z / ⇧⌘Z
+            notePopup?.save()
+            if event.modifierFlags.contains(.shift) {
+                if let mark = redoMarks.popLast() { marks.append(mark); selectedIndex = marks.count - 1 }
+            } else if let mark = marks.popLast() {
+                redoMarks.append(mark); selectedIndex = nil
+            }
+            needsDisplay = true
+            return
+        }
         switch event.keyCode {
         case 53: cancel() // Escape
         case 36:
@@ -330,7 +373,11 @@ private final class OverlayView: NSView {
         case 18: selectPin() // 1
         case 19: selectRectangle() // 2
         case 20: selectArrow() // 3
-        case 51: if !marks.isEmpty { marks.removeLast(); needsDisplay = true } // Delete
+        case 51:
+            notePopup?.save()
+            if let selectedIndex, marks.indices.contains(selectedIndex) { marks.remove(at: selectedIndex) }
+            else if !marks.isEmpty { marks.removeLast() }
+            selectedIndex = nil; redoMarks.removeAll(); needsDisplay = true
         default: super.keyDown(with: event)
         }
     }
@@ -350,10 +397,12 @@ private final class NotePopup: NSObject {
     let window: KeyableOverlayPanel
     let field: NSTextField
     private let onSave: (String) -> Void
+    private let onDelete: () -> Void
 
     init(parent: NSWindow, letter: String, number: Int, near point: NSPoint,
-         initial: String, onSave: @escaping (String) -> Void) {
+         initial: String, onSave: @escaping (String) -> Void, onDelete: @escaping () -> Void) {
         self.onSave = onSave
+        self.onDelete = onDelete
         let width: CGFloat = 440
         let height: CGFloat = 105
         let x = min(max(parent.frame.minX + point.x + 16, parent.frame.minX + 12), parent.frame.maxX - width - 12)
@@ -374,6 +423,9 @@ private final class NotePopup: NSObject {
         let saveButton = NSButton(title: "Сохранить ↩", target: self, action: #selector(saveAction))
         saveButton.frame = NSRect(x: width - 156, y: 8, width: 140, height: 28)
         content.addSubview(saveButton)
+        let deleteButton = NSButton(title: "Удалить метку", target: self, action: #selector(deleteAction))
+        deleteButton.frame = NSRect(x: 16, y: 8, width: 125, height: 28)
+        content.addSubview(deleteButton)
         window.contentView = content
         field.target = self; field.action = #selector(saveAction)
         parent.addChildWindow(window, ordered: .above)
@@ -388,6 +440,10 @@ private final class NotePopup: NSObject {
     }
 
     @objc private func saveAction() { save() }
+    @objc private func deleteAction() {
+        close()
+        onDelete()
+    }
     func save() {
         let text = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         window.parent?.removeChildWindow(window)
