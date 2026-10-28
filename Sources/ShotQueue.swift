@@ -476,42 +476,122 @@ private final class OverlayController {
     func close() { window.orderOut(nil) }
 }
 
+// One mark at both menu-bar and application-icon sizes: a frame in a queue.
+private func queueIcon(size: CGFloat, template: Bool = false) -> NSImage {
+    let image = NSImage(size: NSSize(width: size, height: size), flipped: false) { rect in
+        NSGraphicsContext.saveGraphicsState()
+        let transform = NSAffineTransform()
+        transform.scale(by: size / 100); transform.concat()
+        if !template {
+            let background = NSBezierPath(roundedRect: NSRect(x: 3, y: 3, width: 94, height: 94), xRadius: 22, yRadius: 22)
+            NSGradient(starting: NSColor(calibratedRed: 0.12, green: 0.73, blue: 0.77, alpha: 1),
+                       ending: NSColor(calibratedRed: 0.08, green: 0.38, blue: 0.75, alpha: 1))!.draw(in: background, angle: -60)
+        }
+        (template ? NSColor.black : NSColor.white).setStroke()
+        let back = NSBezierPath()
+        back.move(to: NSPoint(x: 34, y: 79)); back.line(to: NSPoint(x: 77, y: 79))
+        back.curve(to: NSPoint(x: 82, y: 74), controlPoint1: NSPoint(x: 81, y: 79), controlPoint2: NSPoint(x: 82, y: 78))
+        back.line(to: NSPoint(x: 82, y: 34)); back.lineWidth = 5; back.lineCapStyle = .round; back.stroke()
+        let front = NSBezierPath(roundedRect: NSRect(x: 19, y: 22, width: 51, height: 45), xRadius: 7, yRadius: 7)
+        front.lineWidth = 5; front.stroke()
+        let focus = NSBezierPath()
+        focus.move(to: NSPoint(x: 31, y: 42)); focus.line(to: NSPoint(x: 31, y: 54)); focus.line(to: NSPoint(x: 43, y: 54))
+        focus.move(to: NSPoint(x: 58, y: 47)); focus.line(to: NSPoint(x: 58, y: 35)); focus.line(to: NSPoint(x: 46, y: 35))
+        focus.lineWidth = 4; focus.lineCapStyle = .round; focus.lineJoinStyle = .round; focus.stroke()
+        NSGraphicsContext.restoreGraphicsState()
+        return true
+    }
+    image.isTemplate = template
+    return image
+}
+
+private enum Preferences {
+    static let confirmationKey = "confirmBeforeClearing"
+    static var confirmBeforeClearing: Bool {
+        get { UserDefaults.standard.object(forKey: confirmationKey) as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: confirmationKey) }
+    }
+}
+
+private final class SettingsPanel: NSObject {
+    private let window: NSPanel
+    private let confirmation: NSButton
+
+    override init() {
+        window = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 350, height: 115),
+                         styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        confirmation = NSButton(checkboxWithTitle: "Спрашивать перед очисткой очереди", target: nil, action: nil)
+        super.init()
+        window.title = "Настройки ShotQueue"
+        window.isReleasedWhenClosed = false
+        confirmation.target = self; confirmation.action = #selector(changeConfirmation)
+        confirmation.frame = NSRect(x: 20, y: 65, width: 315, height: 24)
+        let hint = NSTextField(wrappingLabelWithString: "При очистке снимки и комментарии остаются в локальном архиве.")
+        hint.font = .systemFont(ofSize: 11); hint.textColor = .secondaryLabelColor
+        hint.frame = NSRect(x: 22, y: 18, width: 304, height: 36)
+        window.contentView?.addSubview(confirmation); window.contentView?.addSubview(hint)
+        window.center()
+    }
+    func show() {
+        confirmation.state = Preferences.confirmBeforeClearing ? .on : .off
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+    }
+    @objc private func changeConfirmation() { Preferences.confirmBeforeClearing = confirmation.state == .on }
+}
+
 private final class QueuePanel {
     let window: NSPanel
     let label: NSTextField
     let captureButton: NSButton
     let copyButton: NSButton
-    init(target: AnyObject, capture: Selector, copy: Selector, clear: Selector) {
-        window = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 270, height: 170),
-                         styleMask: [.titled, .utilityWindow, .nonactivatingPanel], backing: .buffered, defer: false)
-        window.title = "ShotQueue"
+    private let clearButton: NSButton
+    init(target: AnyObject, capture: Selector, copy: Selector, clear: Selector, settings: Selector) {
+        window = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 248, height: 48),
+                         styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         window.level = .floating
         window.isReleasedWhenClosed = false
-        label = NSTextField(labelWithString: "Снимков: 0")
-        label.font = .boldSystemFont(ofSize: 16)
-        label.frame = NSRect(x: 18, y: 112, width: 230, height: 26)
-        captureButton = NSButton(title: "Новый снимок  ⌥⌘S", target: target, action: capture)
-        captureButton.frame = NSRect(x: 18, y: 70, width: 232, height: 31)
-        copyButton = NSButton(title: "Вставить серию  ⌥⌘V", target: target, action: copy)
-        copyButton.frame = NSRect(x: 18, y: 36, width: 232, height: 31)
-        let clearButton = NSButton(title: "Очистить", target: target, action: clear)
-        clearButton.frame = NSRect(x: 18, y: 8, width: 232, height: 27)
-        let content = NSView(frame: NSRect(x: 0, y: 0, width: 270, height: 170))
-        for control in [label, captureButton, copyButton, clearButton] { content.addSubview(control) }
+        window.isOpaque = false; window.backgroundColor = .clear
+        window.hasShadow = true; window.isMovableByWindowBackground = true
+        window.setFrameAutosaveName("CompactQueuePanel")
+        let content = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: 248, height: 48))
+        content.material = .hudWindow; content.blendingMode = .behindWindow; content.state = .active
+        content.wantsLayer = true; content.layer?.cornerRadius = 14; content.layer?.masksToBounds = true
+        content.layer?.borderWidth = 0.5
+        content.layer?.borderColor = NSColor.white.withAlphaComponent(0.2).cgColor
+        label = NSTextField(labelWithString: "0")
+        label.font = .monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
+        label.alignment = .center
+        label.frame = NSRect(x: 10, y: 15, width: 32, height: 18)
+        label.setAccessibilityLabel("Снимков в очереди")
+        func button(_ symbol: String, _ title: String, _ action: Selector, _ x: CGFloat) -> NSButton {
+            let control = NSButton(image: NSImage(systemSymbolName: symbol, accessibilityDescription: title)!, target: target, action: action)
+            control.bezelStyle = .inline; control.isBordered = false
+            control.frame = NSRect(x: x, y: 8, width: 36, height: 32)
+            control.toolTip = title; control.setAccessibilityLabel(title)
+            return control
+        }
+        captureButton = button("camera.viewfinder", "Новый снимок", capture, 50)
+        copyButton = button("square.and.arrow.up.on.square", "Вставить серию", copy, 98)
+        clearButton = button("trash", "Очистить очередь", clear, 146)
+        let settingsButton = button("gearshape", "Настройки", settings, 202)
+        for control in [label, captureButton, copyButton, clearButton, settingsButton] { content.addSubview(control) }
         window.contentView = content
-        if let screen = NSScreen.main {
-            window.setFrameOrigin(NSPoint(x: screen.visibleFrame.maxX - 292, y: screen.visibleFrame.maxY - 190))
+        if !window.setFrameUsingName("CompactQueuePanel"), let screen = NSScreen.main {
+            window.setFrameOrigin(NSPoint(x: screen.visibleFrame.maxX - 268, y: screen.visibleFrame.maxY - 76))
         }
     }
     func show(count: Int) {
-        label.stringValue = "Снимков: \(count)"
+        label.stringValue = "\(count)"
+        label.setAccessibilityValue("\(count)")
         copyButton.isEnabled = count > 0
+        clearButton.isEnabled = count > 0
         window.orderFrontRegardless()
     }
     func hide() { window.orderOut(nil) }
     func setShortcuts(capture: String, paste: String) {
-        captureButton.title = "Новый снимок  \(capture)"
-        copyButton.title = "Вставить серию  \(paste)"
+        captureButton.toolTip = "Новый снимок · \(capture)"
+        copyButton.toolTip = "Вставить серию · \(paste)"
     }
 }
 
@@ -530,6 +610,20 @@ private func hotkeyCallback(_ next: EventHandlerCallRef?, _ event: EventRef?, _ 
 @main private final class ShotQueueApp: NSObject, NSApplicationDelegate {
     static func main() {
         let application = NSApplication.shared
+        if let index = CommandLine.arguments.firstIndex(of: "--export-icon"), CommandLine.arguments.count > index + 1 {
+            let directory = URL(fileURLWithPath: CommandLine.arguments[index + 1], isDirectory: true)
+            try! FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            for size in [16, 32, 128, 256, 512] {
+                for scale in [1, 2] {
+                    let pixels = size * scale
+                    let image = queueIcon(size: CGFloat(pixels))
+                    let rep = NSBitmapImageRep(data: image.tiffRepresentation!)!
+                    let suffix = scale == 2 ? "@2x" : ""
+                    try! rep.representation(using: .png, properties: [:])!.write(to: directory.appendingPathComponent("icon_\(size)x\(size)\(suffix).png"))
+                }
+            }
+            return
+        }
         if CommandLine.arguments.contains("--self-test") {
             guard selfTestRender(), selfTestArchive() else {
                 fputs("Ошибка проверки рендера или архива\n", stderr); exit(1)
@@ -595,6 +689,7 @@ private func hotkeyCallback(_ next: EventHandlerCallRef?, _ event: EventRef?, _ 
     private var pasteMenuItem: NSMenuItem!
     private var overlay: OverlayController?
     private var queuePanel: QueuePanel!
+    private var settingsPanel: SettingsPanel?
     private var captureKey: EventHotKeyRef?
     private var pasteKey: EventHotKeyRef?
     private var handler: EventHandlerRef?
@@ -605,7 +700,8 @@ private func hotkeyCallback(_ next: EventHandlerCallRef?, _ event: EventRef?, _ 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem.button?.title = "SQ"
+        statusItem.button?.image = queueIcon(size: 18, template: true)
+        statusItem.button?.toolTip = "ShotQueue"
         let menu = NSMenu()
         captureMenuItem = NSMenuItem(title: "Новый снимок  ⌥⌘S", action: #selector(captureAction), keyEquivalent: "")
         menu.addItem(captureMenuItem)
@@ -614,10 +710,11 @@ private func hotkeyCallback(_ next: EventHandlerCallRef?, _ event: EventRef?, _ 
         menu.addItem(pasteMenuItem)
         menu.addItem(NSMenuItem(title: "Очистить очередь", action: #selector(clearAction), keyEquivalent: ""))
         menu.addItem(.separator())
+        menu.addItem(NSMenuItem(title: "Настройки…", action: #selector(showSettings), keyEquivalent: ","))
         menu.addItem(NSMenuItem(title: "Выход", action: #selector(quit), keyEquivalent: ""))
         for item in menu.items { item.target = self }
         statusItem.menu = menu
-        queuePanel = QueuePanel(target: self, capture: #selector(captureAction), copy: #selector(pasteAction), clear: #selector(clearAction))
+        queuePanel = QueuePanel(target: self, capture: #selector(captureAction), copy: #selector(pasteAction), clear: #selector(clearAction), settings: #selector(showSettings))
         lastExternalApp = NSWorkspace.shared.frontmostApplication
         activationObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
@@ -659,11 +756,18 @@ private func hotkeyCallback(_ next: EventHandlerCallRef?, _ event: EventRef?, _ 
     @objc private func captureAction() { capture() }
     @objc private func pasteAction() { pasteSeries() }
     @objc private func showQueue() { queuePanel.show(count: store.shots.count) }
+    @objc private func showSettings() {
+        if settingsPanel == nil { settingsPanel = SettingsPanel() }
+        settingsPanel?.show()
+    }
     @objc private func clearAction() {
-        let alert = NSAlert(); alert.messageText = "Очистить очередь из \(store.shots.count) снимков?"
-        alert.informativeText = "Предыдущая серия останется в локальном архиве ShotQueue."
-        alert.addButton(withTitle: "Очистить"); alert.addButton(withTitle: "Отмена")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard !store.shots.isEmpty, !pasting, overlay == nil else { return }
+        if Preferences.confirmBeforeClearing {
+            let alert = NSAlert(); alert.messageText = "Очистить очередь из \(store.shots.count) снимков?"
+            alert.informativeText = "Предыдущая серия останется в локальном архиве ShotQueue."
+            alert.addButton(withTitle: "Очистить"); alert.addButton(withTitle: "Отмена")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        }
         do { try store.clear(); queuePanel.show(count: 0) } catch { showError(error) }
     }
     @objc private func quit() { NSApp.terminate(nil) }
