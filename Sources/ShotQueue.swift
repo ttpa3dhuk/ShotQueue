@@ -7,7 +7,22 @@ import ScreenCaptureKit
 import CoreGraphics
 import ApplicationServices
 
-private enum MarkKind: String, Codable { case pin, rectangle, arrow }
+private enum MarkKind: String, Codable { case pin, rectangle, arrow, brush }
+
+private struct BrushStyle: Codable {
+    var red: Double
+    var green: Double
+    var blue: Double
+    var alpha: Double
+    static let legacy = BrushStyle(red: 0.78, green: 0.78, blue: 0.78, alpha: 1)
+    static let initial = BrushStyle(red: 1, green: 0.22, blue: 0.38, alpha: 0.5)
+    var color: NSColor { NSColor(srgbRed: red, green: green, blue: blue, alpha: alpha) }
+}
+
+private struct BrushPoint: Codable {
+    var x: Double
+    var y: Double
+}
 
 private struct Mark: Codable {
     var kind: MarkKind
@@ -16,6 +31,8 @@ private struct Mark: Codable {
     var endX: Double
     var endY: Double
     var note: String
+    var points: [BrushPoint]? = nil
+    var brushStyle: BrushStyle? = nil
 }
 
 private struct Shot: Codable {
@@ -60,7 +77,9 @@ private final class ShotStore {
         }
         let relative = marks.map { mark in
             Mark(kind: mark.kind, x: mark.x - selection.minX, y: mark.y - selection.minY,
-                 endX: mark.endX - selection.minX, endY: mark.endY - selection.minY, note: mark.note)
+                 endX: mark.endX - selection.minX, endY: mark.endY - selection.minY, note: mark.note,
+                 points: mark.points?.map { BrushPoint(x: $0.x - selection.minX, y: $0.y - selection.minY) },
+                 brushStyle: mark.brushStyle)
         }
         guard let png = render(crop: crop, logicalSize: selection.size, marks: relative, letter: letter) else {
             throw ShotError.renderFailed
@@ -137,6 +156,10 @@ private func drawMarks(_ marks: [Mark], letter: String) {
     for (index, mark) in marks.enumerated() {
         color.setStroke(); color.setFill()
         switch mark.kind {
+        case .brush:
+            let points = mark.points ?? [BrushPoint(x: mark.x, y: mark.y)]
+            drawBrush(points, style: mark.brushStyle ?? .legacy)
+            drawBadge(letter: letter, number: index + 1, at: NSPoint(x: mark.x, y: mark.y))
         case .pin:
             let circle = NSBezierPath(ovalIn: NSRect(x: mark.x - 13, y: mark.y - 13, width: 26, height: 26))
             circle.fill()
@@ -161,6 +184,20 @@ private func drawMarks(_ marks: [Mark], letter: String) {
             head.stroke()
             drawBadge(letter: letter, number: index + 1, at: NSPoint(x: mark.x, y: mark.y))
         }
+    }
+}
+
+private func drawBrush(_ points: [BrushPoint], style: BrushStyle) {
+    guard let first = points.first else { return }
+    style.color.setFill(); style.color.setStroke()
+    let path = NSBezierPath()
+    path.move(to: NSPoint(x: first.x, y: first.y))
+    for point in points.dropFirst() { path.line(to: NSPoint(x: point.x, y: point.y)) }
+    path.lineWidth = 24; path.lineCapStyle = .round; path.lineJoinStyle = .round
+    if points.contains(where: { $0.x != first.x || $0.y != first.y }) {
+        path.stroke()
+    } else {
+        NSBezierPath(ovalIn: NSRect(x: first.x - 12, y: first.y - 12, width: 24, height: 24)).fill()
     }
 }
 
@@ -189,7 +226,7 @@ private func render(crop: CGImage, logicalSize: NSSize, marks: [Mark], letter: S
 }
 
 private final class OverlayView: NSView {
-    enum Mode { case select, pin, rectangle, arrow }
+    enum Mode { case select, pin, rectangle, arrow, brush }
     let image: CGImage
     let displayImage: NSImage
     let letter: String
@@ -202,6 +239,11 @@ private final class OverlayView: NSView {
     var onCancel: (() -> Void)?
     private var start: NSPoint?
     private var current: NSPoint?
+    private var brushPoints: [BrushPoint] = []
+    private var activeBrushStyle = Preferences.brushStyle
+    private var brushColor: NSColorWell!
+    private var brushOpacity: NSSlider!
+    private var opacityLabel: NSTextField!
     private var notePopup: NotePopup?
     private var toolbar: NSStackView!
 
@@ -222,7 +264,8 @@ private final class OverlayView: NSView {
         toolbar.alignment = .centerY
         let entries: [(String, Selector)] = [
             ("Точка 1", #selector(selectPin)), ("Рамка 2", #selector(selectRectangle)),
-            ("Стрелка 3", #selector(selectArrow)), ("Готово ↩", #selector(finish)),
+            ("Стрелка 3", #selector(selectArrow)), ("Кисть 4", #selector(selectBrush)),
+            ("Готово ↩", #selector(finish)),
             ("Отмена Esc", #selector(cancel))
         ]
         for (title, action) in entries {
@@ -230,6 +273,26 @@ private final class OverlayView: NSView {
             button.bezelStyle = .rounded
             toolbar.addArrangedSubview(button)
         }
+        brushColor = NSColorWell(frame: NSRect(x: 0, y: 0, width: 34, height: 25))
+        brushColor.color = Preferences.brushStyle.color
+        brushColor.target = self; brushColor.action = #selector(changeBrushColor)
+        brushColor.toolTip = "Цвет кисти"
+        brushColor.setAccessibilityLabel("Цвет кисти")
+        NSColorPanel.shared.showsAlpha = true
+        NSColorPanel.shared.level = NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue + 1)
+        NSColorPanel.shared.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        toolbar.insertArrangedSubview(brushColor, at: 4)
+        brushOpacity = NSSlider(value: Preferences.brushStyle.alpha * 100, minValue: 10, maxValue: 100,
+                                target: self, action: #selector(changeBrushOpacity))
+        brushOpacity.toolTip = "Непрозрачность кисти: 10–100%"
+        brushOpacity.setAccessibilityLabel("Непрозрачность кисти")
+        brushOpacity.widthAnchor.constraint(equalToConstant: 70).isActive = true
+        toolbar.insertArrangedSubview(brushOpacity, at: 5)
+        opacityLabel = NSTextField(labelWithString: "\(Int(brushOpacity.doubleValue))%")
+        opacityLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        opacityLabel.textColor = .white
+        opacityLabel.widthAnchor.constraint(equalToConstant: 34).isActive = true
+        toolbar.insertArrangedSubview(opacityLabel, at: 6)
         toolbar.isHidden = true
         addSubview(toolbar)
         toolbar.translatesAutoresizingMaskIntoConstraints = false
@@ -246,7 +309,11 @@ private final class OverlayView: NSView {
             displayImage.draw(in: selection, from: selection, operation: .copy, fraction: 1)
             NSColor.systemBlue.setStroke()
             let border = NSBezierPath(rect: selection); border.lineWidth = 2; border.stroke()
+            NSGraphicsContext.saveGraphicsState()
+            NSBezierPath(rect: selection).addClip()
             drawMarks(marks, letter: letter)
+            if mode == .brush { drawBrush(brushPoints, style: activeBrushStyle) }
+            NSGraphicsContext.restoreGraphicsState()
             if let selectedIndex, marks.indices.contains(selectedIndex) {
                 let badge = badgePoint(for: marks[selectedIndex])
                 NSColor.white.setStroke()
@@ -288,7 +355,7 @@ private final class OverlayView: NSView {
         if mode == .select { start = p; current = p; needsDisplay = true; return }
         guard selection?.contains(p) == true else { return }
         notePopup?.save()
-        if let existing = marks.indices.reversed().first(where: { index in
+        if mode != .brush, let existing = marks.indices.reversed().first(where: { index in
             let badge = badgePoint(for: marks[index])
             return hypot(badge.x - p.x, badge.y - p.y) < 17
         }) {
@@ -297,7 +364,12 @@ private final class OverlayView: NSView {
             needsDisplay = true
             return
         }
-        if mode == .pin {
+        if mode == .brush {
+            start = p; current = p
+            activeBrushStyle = Preferences.brushStyle
+            brushPoints = [BrushPoint(x: p.x, y: p.y)]
+            selectedIndex = nil
+        } else if mode == .pin {
             marks.append(Mark(kind: .pin, x: p.x, y: p.y, endX: p.x, endY: p.y, note: ""))
             redoMarks.removeAll(); selectedIndex = marks.count - 1
             editNote(index: marks.count - 1, near: p)
@@ -307,17 +379,31 @@ private final class OverlayView: NSView {
 
     override func mouseDragged(with event: NSEvent) {
         guard start != nil else { return }
-        current = point(event); needsDisplay = true
+        current = point(event)
+        if mode == .brush, let selection, let current {
+            let p = clipped(current, to: selection)
+            brushPoints.append(BrushPoint(x: p.x, y: p.y))
+        }
+        needsDisplay = true
     }
 
     override func mouseUp(with event: NSEvent) {
         guard let start else { return }
         let end = point(event)
-        defer { self.start = nil; self.current = nil; needsDisplay = true }
+        defer { self.start = nil; self.current = nil; brushPoints.removeAll(); needsDisplay = true }
         if mode == .select {
             let rect = rectBetween(start, end)
             guard rect.width >= 30, rect.height >= 30 else { return }
             selection = rect; mode = .pin; toolbar.isHidden = false
+            return
+        }
+        if mode == .brush, let selection {
+            let p = clipped(end, to: selection)
+            brushPoints.append(BrushPoint(x: p.x, y: p.y))
+            marks.append(Mark(kind: .brush, x: start.x, y: start.y, endX: p.x, endY: p.y,
+                              note: "", points: brushPoints, brushStyle: activeBrushStyle))
+            redoMarks.removeAll(); selectedIndex = marks.count - 1
+            editNote(index: marks.count - 1, near: p)
             return
         }
         guard let selection, rectBetween(start, end).width + rectBetween(start, end).height > 12 else { return }
@@ -327,6 +413,10 @@ private final class OverlayView: NSView {
         marks.append(Mark(kind: kind, x: start.x, y: start.y, endX: clippedEnd.x, endY: clippedEnd.y, note: ""))
         redoMarks.removeAll(); selectedIndex = marks.count - 1
         editNote(index: marks.count - 1, near: clippedEnd)
+    }
+
+    private func clipped(_ point: NSPoint, to rect: NSRect) -> NSPoint {
+        NSPoint(x: min(max(point.x, rect.minX), rect.maxX), y: min(max(point.y, rect.minY), rect.maxY))
     }
 
     private func editNote(index: Int, near point: NSPoint) {
@@ -373,6 +463,7 @@ private final class OverlayView: NSView {
         case 18: selectPin() // 1
         case 19: selectRectangle() // 2
         case 20: selectArrow() // 3
+        case 21: selectBrush() // 4
         case 51:
             notePopup?.save()
             if let selectedIndex, marks.indices.contains(selectedIndex) { marks.remove(at: selectedIndex) }
@@ -384,8 +475,25 @@ private final class OverlayView: NSView {
     @objc private func selectPin() { notePopup?.save(); mode = .pin }
     @objc private func selectRectangle() { notePopup?.save(); mode = .rectangle }
     @objc private func selectArrow() { notePopup?.save(); mode = .arrow }
-    @objc private func finish() { notePopup?.save(); if let selection { onFinish?(selection, marks) } }
-    @objc private func cancel() { notePopup?.close(); onCancel?() }
+    @objc private func selectBrush() { notePopup?.save(); mode = .brush; window?.makeFirstResponder(self) }
+    @objc private func changeBrushColor() {
+        guard let color = brushColor.color.usingColorSpace(.sRGB) else { return }
+        let style = BrushStyle(red: color.redComponent, green: color.greenComponent,
+                               blue: color.blueComponent, alpha: max(0.1, color.alphaComponent))
+        Preferences.brushStyle = style
+        brushOpacity.doubleValue = style.alpha * 100
+        opacityLabel.stringValue = "\(Int(brushOpacity.doubleValue.rounded()))%"
+        selectBrush()
+    }
+    @objc private func changeBrushOpacity() {
+        var style = Preferences.brushStyle
+        style.alpha = brushOpacity.doubleValue / 100
+        Preferences.brushStyle = style; brushColor.color = style.color
+        opacityLabel.stringValue = "\(Int(brushOpacity.doubleValue.rounded()))%"
+        selectBrush()
+    }
+    @objc private func finish() { notePopup?.save(); NSColorPanel.shared.orderOut(nil); if let selection { onFinish?(selection, marks) } }
+    @objc private func cancel() { notePopup?.close(); NSColorPanel.shared.orderOut(nil); onCancel?() }
 }
 
 private final class KeyableOverlayPanel: NSPanel {
@@ -506,6 +614,14 @@ private func queueIcon(size: CGFloat, template: Bool = false) -> NSImage {
 }
 
 private enum Preferences {
+    static var brushStyle: BrushStyle {
+        get {
+            guard let data = UserDefaults.standard.data(forKey: "brushStyle"),
+                  let style = try? JSONDecoder().decode(BrushStyle.self, from: data) else { return .initial }
+            return style
+        }
+        set { if let data = try? JSONEncoder().encode(newValue) { UserDefaults.standard.set(data, forKey: "brushStyle") } }
+    }
     static let confirmationKey = "confirmBeforeClearing"
     static var confirmBeforeClearing: Bool {
         get { UserDefaults.standard.object(forKey: confirmationKey) as? Bool ?? true }
@@ -625,10 +741,10 @@ private func hotkeyCallback(_ next: EventHandlerCallRef?, _ event: EventRef?, _ 
             return
         }
         if CommandLine.arguments.contains("--self-test") {
-            guard selfTestRender(), selfTestArchive() else {
-                fputs("Ошибка проверки рендера или архива\n", stderr); exit(1)
+            guard selfTestRender(), selfTestArchive(), selfTestBrush() else {
+                fputs("Ошибка проверки рендера, архива или кисти\n", stderr); exit(1)
             }
-            print("Рендер и архив: проверены")
+            print("Рендер, архив и кисть: проверены")
             return
         }
         if NSRunningApplication.runningApplications(withBundleIdentifier: "life.azat.shotqueue")
@@ -654,6 +770,47 @@ private func hotkeyCallback(_ next: EventHandlerCallRef?, _ event: EventRef?, _ 
               let top = rep.colorAt(x: 100, y: 8)?.usingColorSpace(.deviceRGB),
               let bottom = rep.colorAt(x: 100, y: 92)?.usingColorSpace(.deviceRGB) else { return false }
         return top.redComponent > 0.7 && bottom.redComponent > 0.7
+    }
+
+    private static func selfTestBrush() -> Bool {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("ShotQueue-brush-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        // Older queues have no points field and must still decode.
+        let legacy = Data(#"{"kind":"pin","x":1,"y":1,"endX":1,"endY":1,"note":"old"}"#.utf8)
+        guard let old = try? JSONDecoder().decode(Mark.self, from: legacy), old.points == nil,
+              let context = CGContext(data: nil, width: 400, height: 240, bitsPerComponent: 8,
+                                      bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+        context.setFillColor(NSColor.red.cgColor)
+        context.fill(CGRect(x: 0, y: 0, width: 400, height: 240))
+        guard let image = context.makeImage() else { return false }
+        let store = ShotStore(root: root)
+        let mark = Mark(kind: .brush, x: 60, y: 60, endX: 160, endY: 60, note: "закрытая зона",
+                        points: [BrushPoint(x: 60, y: 60), BrushPoint(x: 110, y: 80), BrushPoint(x: 160, y: 60)],
+                        brushStyle: .legacy)
+        do {
+            try store.append(image: image, selection: NSRect(x: 20, y: 20, width: 160, height: 80),
+                             marks: [mark], screenSize: NSSize(width: 200, height: 120))
+            let loaded = ShotStore(root: root)
+            guard let shot = loaded.shots.first, shot.marks.first?.points?[1].x == 90,
+                  shot.marks.first?.points?[1].y == 60, loaded.markdown().contains("A1: закрытая зона"),
+                  let data = loaded.imageData(for: shot), let rep = NSBitmapImageRep(data: data),
+                  let covered = rep.colorAt(x: 180, y: 40)?.usingColorSpace(.deviceRGB),
+                  let neighbor = rep.colorAt(x: 180, y: 140)?.usingColorSpace(.deviceRGB) else { return false }
+            var transparent = shot.marks[0]
+            transparent.brushStyle = BrushStyle(red: 0, green: 0, blue: 1, alpha: 0.5)
+            guard let crop = image.cropping(to: CGRect(x: 40, y: 40, width: 320, height: 160)),
+                  let png = render(crop: crop, logicalSize: NSSize(width: 160, height: 80), marks: [transparent], letter: "A"),
+                  let transparentRep = NSBitmapImageRep(data: png),
+                  let blend = transparentRep.colorAt(x: 180, y: 40)?.usingColorSpace(.deviceRGB),
+                  blend.redComponent > 0.4, blend.blueComponent > 0.4,
+                  let encoded = try? JSONEncoder().encode(transparent),
+                  let decoded = try? JSONDecoder().decode(Mark.self, from: encoded), decoded.brushStyle?.alpha == 0.5
+            else { return false }
+            return covered.redComponent > 0.7 && abs(covered.redComponent - covered.greenComponent) < 0.01
+                && abs(covered.greenComponent - covered.blueComponent) < 0.01 && covered.alphaComponent > 0.99
+                && neighbor.redComponent > 0.9
+        } catch { return false }
     }
 
     private static func selfTestArchive() -> Bool {
