@@ -57,6 +57,17 @@ private final class ShotStore {
         }
     }
 
+    var expiresAt: Date? {
+        guard Preferences.autoClearEnabled, !shots.isEmpty,
+              let values = try? root.appendingPathComponent("session.json").resourceValues(forKeys: [.contentModificationDateKey]),
+              let modified = values.contentModificationDate else { return nil }
+        return modified.addingTimeInterval(Double(Preferences.autoClearMinutes * 60))
+    }
+
+    func isExpired(at now: Date = Date()) -> Bool {
+        expiresAt.map { now >= $0 } ?? false
+    }
+
     var nextLetter: String? {
         guard shots.count < 26 else { return nil }
         return String(UnicodeScalar(65 + shots.count)!)
@@ -188,17 +199,27 @@ private func drawMarks(_ marks: [Mark], letter: String) {
 }
 
 private func drawBrush(_ points: [BrushPoint], style: BrushStyle) {
-    guard let first = points.first else { return }
-    style.color.setFill(); style.color.setStroke()
+    guard let first = points.first, let context = NSGraphicsContext.current?.cgContext else { return }
+    // Paint the whole gesture opaquely into one group, then apply opacity once.
+    // Duplicate mouse samples and self-intersections cannot darken the stroke.
+    context.saveGState()
+    context.setAlpha(style.alpha)
+    context.beginTransparencyLayer(auxiliaryInfo: nil)
+    style.color.withAlphaComponent(1).setFill()
+    style.color.withAlphaComponent(1).setStroke()
     let path = NSBezierPath()
     path.move(to: NSPoint(x: first.x, y: first.y))
-    for point in points.dropFirst() { path.line(to: NSPoint(x: point.x, y: point.y)) }
-    path.lineWidth = 24; path.lineCapStyle = .round; path.lineJoinStyle = .round
-    if points.contains(where: { $0.x != first.x || $0.y != first.y }) {
-        path.stroke()
-    } else {
-        NSBezierPath(ovalIn: NSRect(x: first.x - 12, y: first.y - 12, width: 24, height: 24)).fill()
+    var previous = first
+    var moved = false
+    for point in points.dropFirst() where point.x != previous.x || point.y != previous.y {
+        path.line(to: NSPoint(x: point.x, y: point.y))
+        previous = point; moved = true
     }
+    path.lineWidth = 24; path.lineCapStyle = .round; path.lineJoinStyle = .round
+    if moved { path.stroke() }
+    else { NSBezierPath(ovalIn: NSRect(x: first.x - 12, y: first.y - 12, width: 24, height: 24)).fill() }
+    context.endTransparencyLayer()
+    context.restoreGState()
 }
 
 private func drawBadge(letter: String, number: Int, at point: NSPoint) {
@@ -242,6 +263,7 @@ private final class OverlayView: NSView {
     private var brushPoints: [BrushPoint] = []
     private var activeBrushStyle = Preferences.brushStyle
     private var brushColor: NSColorWell!
+    private let palette: [NSColor] = [.systemRed, .systemYellow, .systemGreen, .systemBlue, .systemPink, .white, .black]
     private var brushOpacity: NSSlider!
     private var opacityLabel: NSTextField!
     private var notePopup: NotePopup?
@@ -257,6 +279,10 @@ private final class OverlayView: NSView {
     }
     required init?(coder: NSCoder) { fatalError("Use init(frame:image:letter:)") }
     override var acceptsFirstResponder: Bool { true }
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(bounds, cursor: .crosshair)
+    }
 
     private func makeToolbar() {
         toolbar = NSStackView()
@@ -268,11 +294,36 @@ private final class OverlayView: NSView {
             ("Готово ↩", #selector(finish)),
             ("Отмена Esc", #selector(cancel))
         ]
-        for (title, action) in entries {
-            let button = NSButton(title: title, target: self, action: action)
+        let symbols = ["mappin.circle", "rectangle", "arrow.up.right", "paintbrush.pointed"]
+        for (index, entry) in entries.enumerated() {
+            let (title, action) = entry
+            let button = NSButton(title: index < 4 ? "\(index + 1)" : title, target: self, action: action)
+            if index < 4 {
+                button.image = NSImage(systemSymbolName: symbols[index], accessibilityDescription: title)
+                button.imagePosition = .imageLeading
+                button.setAccessibilityLabel(title)
+            }
             button.bezelStyle = .rounded
+            button.toolTip = title
             toolbar.addArrangedSubview(button)
         }
+        let colors = NSStackView()
+        colors.spacing = 3
+        for (index, color) in palette.enumerated() {
+            let button = NSButton(title: "", target: self, action: #selector(selectPaletteColor(_:)))
+            button.tag = index
+            button.isBordered = false
+            button.wantsLayer = true
+            button.layer?.backgroundColor = color.cgColor
+            button.layer?.cornerRadius = 9
+            button.layer?.borderWidth = 1
+            button.layer?.borderColor = NSColor.gray.cgColor
+            button.widthAnchor.constraint(equalToConstant: 18).isActive = true
+            button.heightAnchor.constraint(equalToConstant: 18).isActive = true
+            button.setAccessibilityLabel(["Красный", "Жёлтый", "Зелёный", "Синий", "Розовый", "Белый", "Чёрный"][index])
+            colors.addArrangedSubview(button)
+        }
+        toolbar.addArrangedSubview(colors)
         brushColor = NSColorWell(frame: NSRect(x: 0, y: 0, width: 34, height: 25))
         brushColor.color = Preferences.brushStyle.color
         brushColor.target = self; brushColor.action = #selector(changeBrushColor)
@@ -440,7 +491,22 @@ private final class OverlayView: NSView {
         })
     }
 
+    @discardableResult
+    func handleToolShortcut(_ event: NSEvent) -> Bool {
+        guard selection != nil,
+              event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty else { return false }
+        switch event.keyCode {
+        case 18, 83: selectPin()
+        case 19, 84: selectRectangle()
+        case 20, 85: selectArrow()
+        case 21, 86: selectBrush()
+        default: return false
+        }
+        return true
+    }
+
     override func keyDown(with event: NSEvent) {
+        if handleToolShortcut(event) { return }
         if event.keyCode == 6, event.modifierFlags.contains(.command) { // ⌘Z / ⇧⌘Z
             notePopup?.save()
             if event.modifierFlags.contains(.shift) {
@@ -460,10 +526,6 @@ private final class OverlayView: NSView {
                 toolbar.isHidden = false
                 needsDisplay = true
             } else if selection != nil { finish() } // Return
-        case 18: selectPin() // 1
-        case 19: selectRectangle() // 2
-        case 20: selectArrow() // 3
-        case 21: selectBrush() // 4
         case 51:
             notePopup?.save()
             if let selectedIndex, marks.indices.contains(selectedIndex) { marks.remove(at: selectedIndex) }
@@ -472,10 +534,23 @@ private final class OverlayView: NSView {
         default: super.keyDown(with: event)
         }
     }
-    @objc private func selectPin() { notePopup?.save(); mode = .pin }
-    @objc private func selectRectangle() { notePopup?.save(); mode = .rectangle }
-    @objc private func selectArrow() { notePopup?.save(); mode = .arrow }
-    @objc private func selectBrush() { notePopup?.save(); mode = .brush; window?.makeFirstResponder(self) }
+    private func selectMode(_ next: Mode) {
+        guard selection != nil else { return }
+        notePopup?.save(); mode = next
+        window?.makeFirstResponder(self)
+    }
+    @objc private func selectPin() { selectMode(.pin) }
+    @objc private func selectRectangle() { selectMode(.rectangle) }
+    @objc private func selectArrow() { selectMode(.arrow) }
+    @objc private func selectBrush() { selectMode(.brush) }
+    @objc private func selectPaletteColor(_ sender: NSButton) {
+        guard palette.indices.contains(sender.tag), let color = palette[sender.tag].usingColorSpace(.sRGB) else { return }
+        var style = Preferences.brushStyle
+        style.red = color.redComponent; style.green = color.greenComponent; style.blue = color.blueComponent
+        Preferences.brushStyle = style
+        brushColor.color = style.color
+        selectBrush()
+    }
     @objc private func changeBrushColor() {
         guard let color = brushColor.color.usingColorSpace(.sRGB) else { return }
         let style = BrushStyle(red: color.redComponent, green: color.greenComponent,
@@ -496,9 +571,49 @@ private final class OverlayView: NSView {
     @objc private func cancel() { notePopup?.close(); NSColorPanel.shared.orderOut(nil); onCancel?() }
 }
 
+private enum TextShortcut {
+    case copy, paste, cut, selectAll, undo, redo
+    static func resolve(_ event: NSEvent) -> TextShortcut? {
+        let flags = event.modifierFlags.intersection([.command, .shift, .option, .control])
+        guard flags == .command || flags == [.command, .shift] else { return nil }
+        if event.keyCode == 6 { return flags.contains(.shift) ? .redo : .undo }
+        guard !flags.contains(.shift) else { return nil }
+        switch event.keyCode {
+        case 8: return .copy
+        case 9: return .paste
+        case 7: return .cut
+        case 0: return .selectAll
+        default: return nil
+        }
+    }
+    func apply(to editor: NSTextView) {
+        switch self {
+        case .copy: editor.copy(nil)
+        case .paste: editor.paste(nil)
+        case .cut: editor.cut(nil)
+        case .selectAll: editor.selectAll(nil)
+        case .undo: if editor.undoManager?.canUndo == true { editor.undoManager?.undo() }
+        case .redo: if editor.undoManager?.canRedo == true { editor.undoManager?.redo() }
+        }
+    }
+}
+
 private final class KeyableOverlayPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if let editor = firstResponder as? NSTextView, editor.isEditable,
+           let shortcut = TextShortcut.resolve(event) {
+            shortcut.apply(to: editor)
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .keyDown, !(firstResponder is NSTextView),
+           let overlay = contentView as? OverlayView, overlay.handleToolShortcut(event) { return }
+        super.sendEvent(event)
+    }
 }
 
 private final class NotePopup: NSObject {
@@ -574,6 +689,7 @@ private final class OverlayController {
         window.isOpaque = true
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         window.hasShadow = false
+        window.allowsToolTipsWhenApplicationIsInactive = true
         view = OverlayView(frame: NSRect(origin: .zero, size: screen.frame.size), image: image, letter: letter)
         view.onFinish = onFinish; view.onCancel = onCancel
         window.contentView = view
@@ -622,6 +738,17 @@ private enum Preferences {
         }
         set { if let data = try? JSONEncoder().encode(newValue) { UserDefaults.standard.set(data, forKey: "brushStyle") } }
     }
+    static var autoClearEnabled: Bool {
+        get { UserDefaults.standard.object(forKey: "autoClearEnabled") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "autoClearEnabled") }
+    }
+    static var autoClearMinutes: Int {
+        get {
+            let value = UserDefaults.standard.object(forKey: "autoClearMinutes") as? Int ?? 5
+            return min(1440, max(1, value))
+        }
+        set { UserDefaults.standard.set(min(1440, max(1, newValue)), forKey: "autoClearMinutes") }
+    }
     static let confirmationKey = "confirmBeforeClearing"
     static var confirmBeforeClearing: Bool {
         get { UserDefaults.standard.object(forKey: confirmationKey) as? Bool ?? true }
@@ -629,31 +756,74 @@ private enum Preferences {
     }
 }
 
-private final class SettingsPanel: NSObject {
+private final class SettingsPanel: NSObject, NSTextFieldDelegate {
     private let window: NSPanel
     private let confirmation: NSButton
+    private let autoClear: NSButton
+    private let minutes: NSTextField
+    private let stepper: NSStepper
 
     override init() {
-        window = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 350, height: 115),
+        window = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 400, height: 200),
                          styleMask: [.titled, .closable], backing: .buffered, defer: false)
         confirmation = NSButton(checkboxWithTitle: "Спрашивать перед очисткой очереди", target: nil, action: nil)
+        autoClear = NSButton(checkboxWithTitle: "Автоочистка", target: nil, action: nil)
+        minutes = NSTextField(string: "5")
+        stepper = NSStepper()
         super.init()
         window.title = "Настройки ShotQueue"
         window.isReleasedWhenClosed = false
         confirmation.target = self; confirmation.action = #selector(changeConfirmation)
-        confirmation.frame = NSRect(x: 20, y: 65, width: 315, height: 24)
-        let hint = NSTextField(wrappingLabelWithString: "При очистке снимки и комментарии остаются в локальном архиве.")
+        confirmation.frame = NSRect(x: 20, y: 155, width: 360, height: 24)
+        autoClear.target = self; autoClear.action = #selector(changeAutoClear)
+        autoClear.frame = NSRect(x: 20, y: 116, width: 145, height: 24)
+        minutes.frame = NSRect(x: 170, y: 115, width: 58, height: 24)
+        minutes.alignment = .right
+        minutes.delegate = self
+        minutes.setAccessibilityLabel("Минут до автоочистки")
+        stepper.frame = NSRect(x: 232, y: 114, width: 20, height: 27)
+        stepper.minValue = 1; stepper.maxValue = 1440; stepper.increment = 1
+        stepper.target = self; stepper.action = #selector(stepMinutes)
+        stepper.setAccessibilityLabel("Минут до автоочистки")
+        let unit = NSTextField(labelWithString: "мин.")
+        unit.frame = NSRect(x: 260, y: 118, width: 55, height: 20)
+        let hint = NSTextField(wrappingLabelWithString: "Отсчёт идёт от последнего снимка: от 1 до 1440 минут. Автоочистка проходит без вопроса. Снимки и комментарии остаются в локальном архиве.")
         hint.font = .systemFont(ofSize: 11); hint.textColor = .secondaryLabelColor
-        hint.frame = NSRect(x: 22, y: 18, width: 304, height: 36)
-        window.contentView?.addSubview(confirmation); window.contentView?.addSubview(hint)
+        hint.frame = NSRect(x: 22, y: 20, width: 354, height: 73)
+        for view in [confirmation, autoClear, minutes, stepper, unit, hint] {
+            window.contentView?.addSubview(view)
+        }
         window.center()
     }
     func show() {
         confirmation.state = Preferences.confirmBeforeClearing ? .on : .off
+        updateAutoClearControls()
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
     }
+    var isVisible: Bool { window.isVisible }
+    private func updateAutoClearControls() {
+        autoClear.state = Preferences.autoClearEnabled ? .on : .off
+        minutes.integerValue = Preferences.autoClearMinutes
+        stepper.integerValue = Preferences.autoClearMinutes
+        minutes.isEnabled = Preferences.autoClearEnabled
+        stepper.isEnabled = Preferences.autoClearEnabled
+    }
     @objc private func changeConfirmation() { Preferences.confirmBeforeClearing = confirmation.state == .on }
+    @objc private func changeAutoClear() {
+        Preferences.autoClearEnabled = autoClear.state == .on
+        updateAutoClearControls()
+    }
+    @objc private func stepMinutes() {
+        Preferences.autoClearMinutes = stepper.integerValue
+        updateAutoClearControls()
+    }
+    func controlTextDidEndEditing(_ notification: Notification) {
+        if let value = Int(minutes.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            Preferences.autoClearMinutes = value
+        }
+        updateAutoClearControls()
+    }
 }
 
 private final class QueuePanel {
@@ -663,39 +833,46 @@ private final class QueuePanel {
     let copyButton: NSButton
     private let clearButton: NSButton
     init(target: AnyObject, capture: Selector, copy: Selector, clear: Selector, settings: Selector) {
-        window = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 248, height: 48),
+        window = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 188, height: 44),
                          styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         window.level = .floating
+        window.allowsToolTipsWhenApplicationIsInactive = true
         window.isReleasedWhenClosed = false
         window.isOpaque = false; window.backgroundColor = .clear
         window.hasShadow = true; window.isMovableByWindowBackground = true
         window.setFrameAutosaveName("CompactQueuePanel")
-        let content = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: 248, height: 48))
-        content.material = .hudWindow; content.blendingMode = .behindWindow; content.state = .active
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: 188, height: 44))
+        let glass = NSVisualEffectView(frame: content.bounds)
+        glass.autoresizingMask = [.width, .height]
+        glass.material = .hudWindow; glass.blendingMode = .behindWindow; glass.state = .active
+        glass.alphaValue = 0.72
+        content.addSubview(glass)
         content.wantsLayer = true; content.layer?.cornerRadius = 14; content.layer?.masksToBounds = true
         content.layer?.borderWidth = 0.5
         content.layer?.borderColor = NSColor.white.withAlphaComponent(0.2).cgColor
         label = NSTextField(labelWithString: "0")
         label.font = .monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
         label.alignment = .center
-        label.frame = NSRect(x: 10, y: 15, width: 32, height: 18)
+        label.frame = NSRect(x: 6, y: 13, width: 24, height: 18)
         label.setAccessibilityLabel("Снимков в очереди")
+        label.toolTip = "Снимков в очереди"
         func button(_ symbol: String, _ title: String, _ action: Selector, _ x: CGFloat) -> NSButton {
             let control = NSButton(image: NSImage(systemSymbolName: symbol, accessibilityDescription: title)!, target: target, action: action)
             control.bezelStyle = .inline; control.isBordered = false
-            control.frame = NSRect(x: x, y: 8, width: 36, height: 32)
+            control.frame = NSRect(x: x, y: 6, width: 32, height: 32)
             control.toolTip = title; control.setAccessibilityLabel(title)
             return control
         }
-        captureButton = button("camera.viewfinder", "Новый снимок", capture, 50)
-        copyButton = button("square.and.arrow.up.on.square", "Вставить серию", copy, 98)
-        clearButton = button("trash", "Очистить очередь", clear, 146)
-        let settingsButton = button("gearshape", "Настройки", settings, 202)
+        captureButton = button("camera.viewfinder", "Новый снимок", capture, 34)
+        copyButton = button("doc.on.clipboard", "Вставить снимки и комментарии в поле ввода", copy, 70)
+        clearButton = button("trash", "Очистить очередь", clear, 106)
+        let settingsButton = button("gearshape", "Настройки", settings, 142)
         for control in [label, captureButton, copyButton, clearButton, settingsButton] { content.addSubview(control) }
         window.contentView = content
         if !window.setFrameUsingName("CompactQueuePanel"), let screen = NSScreen.main {
-            window.setFrameOrigin(NSPoint(x: screen.visibleFrame.maxX - 268, y: screen.visibleFrame.maxY - 76))
+            window.setFrameOrigin(NSPoint(x: screen.visibleFrame.maxX - 208, y: screen.visibleFrame.maxY - 76))
         }
+        window.setContentSize(NSSize(width: 188, height: 44))
     }
     func show(count: Int) {
         label.stringValue = "\(count)"
@@ -707,7 +884,7 @@ private final class QueuePanel {
     func hide() { window.orderOut(nil) }
     func setShortcuts(capture: String, paste: String) {
         captureButton.toolTip = "Новый снимок · \(capture)"
-        copyButton.toolTip = "Вставить серию · \(paste)"
+        copyButton.toolTip = "Вставить снимки и комментарии в поле ввода · \(paste)"
     }
 }
 
@@ -718,7 +895,7 @@ private func hotkeyCallback(_ next: EventHandlerCallRef?, _ event: EventRef?, _ 
                                    nil, MemoryLayout<EventHotKeyID>.size, nil, &id)
     if status == noErr {
         let app = Unmanaged<ShotQueueApp>.fromOpaque(userData).takeUnretainedValue()
-        DispatchQueue.main.async { if id.id == 1 { app.capture() } else if id.id == 2 { app.pasteSeries() } }
+        DispatchQueue.main.async { if id.id == 1 { app.capture() } else if id.id == 2 { app.pasteSeries() } else if id.id == 3 { app.clearAction() } }
     }
     return noErr
 }
@@ -741,7 +918,7 @@ private func hotkeyCallback(_ next: EventHandlerCallRef?, _ event: EventRef?, _ 
             return
         }
         if CommandLine.arguments.contains("--self-test") {
-            guard selfTestRender(), selfTestArchive(), selfTestBrush() else {
+            guard selfTestRender(), selfTestArchive(), selfTestBrush(), selfTestBrushUniformity(), selfTestKeyboard() else {
                 fputs("Ошибка проверки рендера, архива или кисти\n", stderr); exit(1)
             }
             print("Рендер, архив и кисть: проверены")
@@ -770,6 +947,59 @@ private func hotkeyCallback(_ next: EventHandlerCallRef?, _ event: EventRef?, _ 
               let top = rep.colorAt(x: 100, y: 8)?.usingColorSpace(.deviceRGB),
               let bottom = rep.colorAt(x: 100, y: 92)?.usingColorSpace(.deviceRGB) else { return false }
         return top.redComponent > 0.7 && bottom.redComponent > 0.7
+    }
+
+    private static func selfTestKeyboard() -> Bool {
+        func key(_ code: UInt16, _ text: String, _ flags: NSEvent.ModifierFlags = []) -> NSEvent {
+            NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: flags, timestamp: 0,
+                             windowNumber: 0, context: nil, characters: text,
+                             charactersIgnoringModifiers: text, isARepeat: false, keyCode: code)!
+        }
+        guard TextShortcut.resolve(key(8, "с", .command)) == .copy,
+              TextShortcut.resolve(key(9, "м", .command)) == .paste,
+              TextShortcut.resolve(key(0, "ф", .command)) == .selectAll,
+              TextShortcut.resolve(key(6, "я", [.command, .shift])) == .redo,
+              TextShortcut.resolve(key(9, "м", [.command, .option])) == nil,
+              let context = CGContext(data: nil, width: 200, height: 120, bitsPerComponent: 8,
+                                      bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
+              let image = context.makeImage() else { return false }
+        let view = OverlayView(frame: NSRect(x: 0, y: 0, width: 200, height: 120), image: image, letter: "A")
+        guard !view.handleToolShortcut(key(18, "1")) else { return false }
+        view.selection = view.bounds
+        for (code, mode) in [(UInt16(18), OverlayView.Mode.pin), (19, .rectangle), (20, .arrow), (21, .brush), (83, .pin)] {
+            guard view.handleToolShortcut(key(code, "1")), view.mode == mode else { return false }
+        }
+        let panel = KeyableOverlayPanel(contentRect: view.bounds, styleMask: [.borderless], backing: .buffered, defer: false)
+        panel.isReleasedWhenClosed = false
+        let editor = NSTextView(frame: view.bounds)
+        editor.string = "тест 1234"
+        panel.contentView = editor
+        guard panel.makeFirstResponder(editor),
+              panel.performKeyEquivalent(with: key(0, "ф", .command)),
+              editor.selectedRange().length == editor.string.utf16.count else { return false }
+        return !view.handleToolShortcut(key(18, "1", .command))
+    }
+
+    private static func selfTestBrushUniformity() -> Bool {
+        guard let source = CGContext(data: nil, width: 200, height: 120, bitsPerComponent: 8,
+                                     bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                                     bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+        source.setFillColor(NSColor.white.cgColor)
+        source.fill(CGRect(x: 0, y: 0, width: 200, height: 120))
+        guard let image = source.makeImage() else { return false }
+        // Pause at x=100, then retrace the same stroke: opacity must stay uniform.
+        let xs: [Double] = [20, 60, 100, 100, 100, 140, 100, 180]
+        let mark = Mark(kind: .brush, x: 20, y: 60, endX: 180, endY: 60, note: "",
+                        points: xs.map { BrushPoint(x: $0, y: 60) }, brushStyle: .initial)
+        guard let png = render(crop: image, logicalSize: NSSize(width: 200, height: 120), marks: [mark], letter: "A"),
+              let rep = NSBitmapImageRep(data: png),
+              let normal = rep.colorAt(x: 50, y: 60)?.usingColorSpace(.deviceRGB),
+              let paused = rep.colorAt(x: 100, y: 60)?.usingColorSpace(.deviceRGB),
+              let retraced = rep.colorAt(x: 125, y: 60)?.usingColorSpace(.deviceRGB) else { return false }
+        return abs(normal.greenComponent - paused.greenComponent) < 0.015
+            && abs(normal.greenComponent - retraced.greenComponent) < 0.015
+            && abs(normal.blueComponent - paused.blueComponent) < 0.015
     }
 
     private static func selfTestBrush() -> Bool {
@@ -814,6 +1044,17 @@ private func hotkeyCallback(_ next: EventHandlerCallRef?, _ event: EventRef?, _ 
     }
 
     private static func selfTestArchive() -> Bool {
+        let defaults = UserDefaults.standard
+        let oldEnabled = defaults.object(forKey: "autoClearEnabled")
+        let oldMinutes = defaults.object(forKey: "autoClearMinutes")
+        defer {
+            if let oldEnabled { defaults.set(oldEnabled, forKey: "autoClearEnabled") }
+            else { defaults.removeObject(forKey: "autoClearEnabled") }
+            if let oldMinutes { defaults.set(oldMinutes, forKey: "autoClearMinutes") }
+            else { defaults.removeObject(forKey: "autoClearMinutes") }
+        }
+        Preferences.autoClearEnabled = true
+        Preferences.autoClearMinutes = 5
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("ShotQueue-test-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: root) }
         let store = ShotStore(root: root)
@@ -828,7 +1069,28 @@ private func hotkeyCallback(_ next: EventHandlerCallRef?, _ event: EventRef?, _ 
             try store.append(image: image, selection: NSRect(x: 0, y: 0, width: 100, height: 50),
                              marks: [mark], screenSize: NSSize(width: 100, height: 50))
             guard store.shots.count == 1, store.markdown().contains("A1: проверка") else { return false }
+            guard let deadline = store.expiresAt,
+                  !store.isExpired(at: deadline.addingTimeInterval(-1)),
+                  store.isExpired(at: deadline),
+                  ShotStore(root: root).expiresAt == deadline else { return false }
+            Preferences.autoClearEnabled = false
+            guard store.expiresAt == nil, !store.isExpired(at: deadline.addingTimeInterval(3600)) else { return false }
+            Preferences.autoClearEnabled = true
+            Preferences.autoClearMinutes = 10
+            guard let extended = store.expiresAt, abs(extended.timeIntervalSince(deadline) - 300) < 0.01 else { return false }
+            Preferences.autoClearMinutes = 0
+            guard Preferences.autoClearMinutes == 1 else { return false }
+            Preferences.autoClearMinutes = 2000
+            guard Preferences.autoClearMinutes == 1440 else { return false }
+            Preferences.autoClearMinutes = 5
+            try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-301)],
+                                                  ofItemAtPath: root.appendingPathComponent("session.json").path)
+            guard ShotStore(root: root).isExpired() else { return false }
+            try store.append(image: image, selection: NSRect(x: 0, y: 0, width: 100, height: 50),
+                             marks: [], screenSize: NSSize(width: 100, height: 50))
+            guard !store.isExpired() else { return false }
             try store.clear()
+            guard store.expiresAt == nil else { return false }
             let archives = try FileManager.default.contentsOfDirectory(at: root.appendingPathComponent("Archive"),
                                                                          includingPropertiesForKeys: nil)
             guard store.shots.isEmpty, archives.count == 1,
@@ -849,6 +1111,9 @@ private func hotkeyCallback(_ next: EventHandlerCallRef?, _ event: EventRef?, _ 
     private var settingsPanel: SettingsPanel?
     private var captureKey: EventHotKeyRef?
     private var pasteKey: EventHotKeyRef?
+    private var clearKey: EventHotKeyRef?
+    private var expiryTimer: Timer?
+    private var capturing = false
     private var handler: EventHandlerRef?
     private var lastExternalApp: NSRunningApplication?
     private var activationObserver: NSObjectProtocol?
@@ -856,6 +1121,7 @@ private func hotkeyCallback(_ next: EventHandlerCallRef?, _ event: EventRef?, _ 
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        installEditingMenu()
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.image = queueIcon(size: 18, template: true)
         statusItem.button?.toolTip = "ShotQueue"
@@ -881,7 +1147,51 @@ private func hotkeyCallback(_ next: EventHandlerCallRef?, _ event: EventRef?, _ 
             self?.lastExternalApp = app
         }
         registerHotkeys()
+        refreshQueue()
+        expireQueueIfNeeded()
+        expiryTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            self?.statusItem.button?.toolTip = "Снимков: \(self?.store.shots.count ?? 0). " + (Preferences.autoClearEnabled
+                ? "Автоочистка: \(Preferences.autoClearMinutes) мин. после последнего снимка."
+                : "Автоочистка выключена.")
+            self?.expireQueueIfNeeded()
+        }
+    }
+
+    private func refreshQueue() {
+        statusItem.button?.title = " \(store.shots.count)"
+        statusItem.button?.imagePosition = .imageLeading
+        statusItem.button?.toolTip = "Снимков: \(store.shots.count). " + (Preferences.autoClearEnabled
+            ? "Автоочистка: \(Preferences.autoClearMinutes) мин. после последнего снимка."
+            : "Автоочистка выключена.")
         queuePanel.show(count: store.shots.count)
+    }
+
+    private func expireQueueIfNeeded() {
+        guard settingsPanel?.isVisible != true, !pasting, !capturing, overlay == nil, store.isExpired() else { return }
+        do { try store.clear(); refreshQueue() }
+        catch { expiryTimer?.invalidate(); showError(error) }
+    }
+
+    private func installEditingMenu() {
+        let main = NSMenu()
+        let application = NSMenu(title: "ShotQueue")
+        application.addItem(NSMenuItem(title: "Завершить ShotQueue", action: #selector(quit), keyEquivalent: "q"))
+        application.items.first?.target = self
+        let appItem = NSMenuItem(title: "ShotQueue", action: nil, keyEquivalent: "")
+        appItem.submenu = application; main.addItem(appItem)
+        let edit = NSMenu(title: "Правка")
+        let entries: [(String, Selector, String)] = [
+            ("Отменить", Selector(("undo:")), "z"),
+            ("Повторить", Selector(("redo:")), "Z"),
+            ("Вырезать", #selector(NSText.cut(_:)), "x"),
+            ("Копировать", #selector(NSText.copy(_:)), "c"),
+            ("Вставить", #selector(NSText.paste(_:)), "v"),
+            ("Выделить всё", #selector(NSText.selectAll(_:)), "a")
+        ]
+        for (title, action, key) in entries { edit.addItem(NSMenuItem(title: title, action: action, keyEquivalent: key)) }
+        let item = NSMenuItem(title: "Правка", action: nil, keyEquivalent: "")
+        item.submenu = edit; main.addItem(item)
+        NSApp.mainMenu = main
     }
 
     private func registerHotkeys() {
@@ -905,6 +1215,11 @@ private func hotkeyCallback(_ next: EventHandlerCallRef?, _ event: EventRef?, _ 
                 EventHotKeyID(signature: 0x53515145, id: 2), GetApplicationEventTarget(), 0, &pasteKey)
             pasteShortcut = fallback == noErr ? "⇧⌥⌘V" : "через кнопку"
         }
+        let clearStatus = RegisterEventHotKey(2, UInt32(cmdKey | optionKey),
+            EventHotKeyID(signature: 0x53515145, id: 3), GetApplicationEventTarget(), 0, &clearKey)
+        if let item = statusItem.menu?.items.first(where: { $0.action == #selector(clearAction) }) {
+            item.title = clearStatus == noErr ? "Очистить очередь  ⌥⌘D" : "Очистить очередь (⌥⌘D занято)"
+        }
         captureMenuItem.title = "Новый снимок  \(captureShortcut)"
         pasteMenuItem.title = "Вставить серию  \(pasteShortcut)"
         queuePanel.setShortcuts(capture: captureShortcut, paste: pasteShortcut)
@@ -917,20 +1232,21 @@ private func hotkeyCallback(_ next: EventHandlerCallRef?, _ event: EventRef?, _ 
         if settingsPanel == nil { settingsPanel = SettingsPanel() }
         settingsPanel?.show()
     }
-    @objc private func clearAction() {
-        guard !store.shots.isEmpty, !pasting, overlay == nil else { return }
+    @objc func clearAction() {
+        guard !store.shots.isEmpty, !pasting, !capturing, overlay == nil else { return }
         if Preferences.confirmBeforeClearing {
             let alert = NSAlert(); alert.messageText = "Очистить очередь из \(store.shots.count) снимков?"
             alert.informativeText = "Предыдущая серия останется в локальном архиве ShotQueue."
             alert.addButton(withTitle: "Очистить"); alert.addButton(withTitle: "Отмена")
             guard alert.runModal() == .alertFirstButtonReturn else { return }
         }
-        do { try store.clear(); queuePanel.show(count: 0) } catch { showError(error) }
+        do { try store.clear(); refreshQueue() } catch { showError(error) }
     }
     @objc private func quit() { NSApp.terminate(nil) }
 
     func capture() {
-        guard overlay == nil else { return }
+        expireQueueIfNeeded()
+        guard overlay == nil, !capturing, !pasting else { return }
         guard let letter = store.nextLetter else { showError(ShotError.queueFull); return }
         guard let screen = NSScreen.screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) }) ?? NSScreen.main else { return }
         guard CGPreflightScreenCaptureAccess() else {
@@ -941,9 +1257,11 @@ private func hotkeyCallback(_ next: EventHandlerCallRef?, _ event: EventRef?, _ 
             alert.runModal()
             return
         }
+        capturing = true
         queuePanel.hide()
         Task { @MainActor [weak self] in
             guard let self else { return }
+            defer { self.capturing = false }
             do {
                 try? await Task.sleep(nanoseconds: 200_000_000) // дать панели исчезнуть до снимка
                 let image = try await SCScreenshotManager.captureImage(in: screen.frame)
@@ -953,19 +1271,20 @@ private func hotkeyCallback(_ next: EventHandlerCallRef?, _ event: EventRef?, _ 
                         self.overlay?.close(); self.overlay = nil
                         do { try self.store.append(image: image, selection: selection, marks: marks, screenSize: screen.frame.size) }
                         catch { self.showError(error) }
-                        self.queuePanel.show(count: self.store.shots.count)
+                        self.refreshQueue()
                     }, onCancel: { [weak self] in
                         self?.overlay?.close(); self?.overlay = nil
-                        if let self { self.queuePanel.show(count: self.store.shots.count) }
+                        if let self { self.refreshQueue() }
                     })
             } catch {
-                self.showError(error); self.queuePanel.show(count: self.store.shots.count)
+                self.showError(error); self.refreshQueue()
             }
         }
     }
 
     func pasteSeries() {
-        guard !store.shots.isEmpty, !pasting else { return }
+        expireQueueIfNeeded()
+        guard !store.shots.isEmpty, !pasting, !capturing, overlay == nil else { return }
         guard AXIsProcessTrusted() else {
             let alert = NSAlert()
             alert.messageText = "Разреши ShotQueue Универсальный доступ"
@@ -985,7 +1304,7 @@ private func hotkeyCallback(_ next: EventHandlerCallRef?, _ event: EventRef?, _ 
         queuePanel.hide()
         Task { @MainActor [weak self] in
             guard let self else { return }
-            defer { self.pasting = false; self.queuePanel.show(count: self.store.shots.count) }
+            defer { self.pasting = false; self.refreshQueue() }
             do {
                 _ = target.activate(options: [])
                 try await Task.sleep(nanoseconds: 250_000_000)
