@@ -756,6 +756,51 @@ private enum Preferences {
     }
 }
 
+private final class AboutPanel: NSObject {
+    private let window: NSPanel
+    static let github = URL(string: "https://github.com/ttpa3dhuk/ShotQueue")!
+    static let donate = URL(string: "https://pay.cloudtips.ru/p/b79fa042")!
+
+    override init() {
+        window = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 410, height: 280),
+                         styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        super.init()
+        window.title = "О программе"
+        window.isReleasedWhenClosed = false
+        let icon = NSImageView(frame: NSRect(x: 28, y: 192, width: 56, height: 56))
+        icon.image = queueIcon(size: 56)
+        let name = NSTextField(labelWithString: "ShotQueue")
+        name.font = .boldSystemFont(ofSize: 23)
+        name.frame = NSRect(x: 100, y: 221, width: 275, height: 30)
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "неизвестна"
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
+        let details = NSTextField(labelWithString: "Версия \(version) (сборка \(build))")
+        details.frame = NSRect(x: 100, y: 197, width: 280, height: 20)
+        details.isSelectable = true
+        let description = NSTextField(wrappingLabelWithString: "Снимки экрана с пометками и комментариями.\nБесплатно, без ключей и активации. MIT.\n© 2026 Azat Khusaenov")
+        description.frame = NSRect(x: 28, y: 116, width: 354, height: 66)
+        let support = NSTextField(wrappingLabelWithString: "Если ShotQueue тебе полезен, можно поддержать разработку донатом. Это добровольно.")
+        support.frame = NSRect(x: 28, y: 62, width: 354, height: 44)
+        for view in [icon, name, details, description, support] { window.contentView?.addSubview(view) }
+        let entries: [(String, Selector, CGFloat, CGFloat)] = [
+            ("GitHub", #selector(openGitHub), 24, 85),
+            ("Поддержать", #selector(openDonate), 116, 135),
+            ("Закрыть", #selector(close), 276, 110)
+        ]
+        for (title, action, x, width) in entries {
+            let button = NSButton(title: title, target: self, action: action)
+            button.bezelStyle = .rounded
+            button.frame = NSRect(x: x, y: 18, width: width, height: 30)
+            window.contentView?.addSubview(button)
+        }
+        window.center()
+    }
+    func show() { NSApp.activate(ignoringOtherApps: true); window.makeKeyAndOrderFront(nil) }
+    @objc private func openGitHub() { NSWorkspace.shared.open(Self.github) }
+    @objc private func openDonate() { NSWorkspace.shared.open(Self.donate) }
+    @objc private func close() { window.close() }
+}
+
 private final class SettingsPanel: NSObject, NSTextFieldDelegate {
     private let window: NSPanel
     private let confirmation: NSButton
@@ -1109,6 +1154,7 @@ private func hotkeyCallback(_ next: EventHandlerCallRef?, _ event: EventRef?, _ 
     private var overlay: OverlayController?
     private var queuePanel: QueuePanel!
     private var settingsPanel: SettingsPanel?
+    private var aboutPanel: AboutPanel?
     private var captureKey: EventHotKeyRef?
     private var pasteKey: EventHotKeyRef?
     private var clearKey: EventHotKeyRef?
@@ -1134,6 +1180,7 @@ private func hotkeyCallback(_ next: EventHandlerCallRef?, _ event: EventRef?, _ 
         menu.addItem(NSMenuItem(title: "Очистить очередь", action: #selector(clearAction), keyEquivalent: ""))
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Настройки…", action: #selector(showSettings), keyEquivalent: ","))
+        menu.addItem(NSMenuItem(title: "О программе…", action: #selector(showAbout), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Выход", action: #selector(quit), keyEquivalent: ""))
         for item in menu.items { item.target = self }
         statusItem.menu = menu
@@ -1175,8 +1222,10 @@ private func hotkeyCallback(_ next: EventHandlerCallRef?, _ event: EventRef?, _ 
     private func installEditingMenu() {
         let main = NSMenu()
         let application = NSMenu(title: "ShotQueue")
+        application.addItem(NSMenuItem(title: "О ShotQueue…", action: #selector(showAbout), keyEquivalent: ""))
+        application.addItem(.separator())
         application.addItem(NSMenuItem(title: "Завершить ShotQueue", action: #selector(quit), keyEquivalent: "q"))
-        application.items.first?.target = self
+        for item in application.items { item.target = self }
         let appItem = NSMenuItem(title: "ShotQueue", action: nil, keyEquivalent: "")
         appItem.submenu = application; main.addItem(appItem)
         let edit = NSMenu(title: "Правка")
@@ -1231,6 +1280,10 @@ private func hotkeyCallback(_ next: EventHandlerCallRef?, _ event: EventRef?, _ 
     @objc private func showSettings() {
         if settingsPanel == nil { settingsPanel = SettingsPanel() }
         settingsPanel?.show()
+    }
+    @objc private func showAbout() {
+        if aboutPanel == nil { aboutPanel = AboutPanel() }
+        aboutPanel?.show()
     }
     @objc func clearAction() {
         guard !store.shots.isEmpty, !pasting, !capturing, overlay == nil else { return }
