@@ -411,7 +411,7 @@ private final class OverlayView: NSView {
             return hypot(badge.x - p.x, badge.y - p.y) < 17
         }) {
             selectedIndex = existing
-            editNote(index: existing, near: p)
+            editNote(index: existing, near: p, isNew: false)
             needsDisplay = true
             return
         }
@@ -470,10 +470,15 @@ private final class OverlayView: NSView {
         NSPoint(x: min(max(point.x, rect.minX), rect.maxX), y: min(max(point.y, rect.minY), rect.maxY))
     }
 
-    private func editNote(index: Int, near point: NSPoint) {
+    override func rightMouseDown(with event: NSEvent) {
+        if let notePopup { notePopup.cancelPlacement(); return }
+        start = nil; current = nil; brushPoints.removeAll(); needsDisplay = true
+    }
+
+    private func editNote(index: Int, near point: NSPoint, isNew: Bool = true) {
         guard let parent = window else { return }
         notePopup = NotePopup(parent: parent, letter: letter, number: index + 1,
-                              near: point, initial: marks[index].note,
+                              near: point, initial: marks[index].note, isNew: isNew,
                               onSave: { [weak self] text in
             guard let self else { return }
             if self.marks.indices.contains(index) { self.marks[index].note = text }
@@ -599,6 +604,7 @@ private enum TextShortcut {
 }
 
 private final class KeyableOverlayPanel: NSPanel {
+    var onRightClick: (() -> Void)?
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
@@ -610,6 +616,7 @@ private final class KeyableOverlayPanel: NSPanel {
         return super.performKeyEquivalent(with: event)
     }
     override func sendEvent(_ event: NSEvent) {
+        if event.type == .rightMouseDown, let onRightClick { onRightClick(); return }
         if event.type == .keyDown, !(firstResponder is NSTextView),
            let overlay = contentView as? OverlayView, overlay.handleToolShortcut(event) { return }
         super.sendEvent(event)
@@ -621,11 +628,13 @@ private final class NotePopup: NSObject {
     let field: NSTextField
     private let onSave: (String) -> Void
     private let onDelete: () -> Void
+    private let isNew: Bool
 
     init(parent: NSWindow, letter: String, number: Int, near point: NSPoint,
-         initial: String, onSave: @escaping (String) -> Void, onDelete: @escaping () -> Void) {
+         initial: String, isNew: Bool, onSave: @escaping (String) -> Void, onDelete: @escaping () -> Void) {
         self.onSave = onSave
         self.onDelete = onDelete
+        self.isNew = isNew
         let width: CGFloat = 440
         let height: CGFloat = 105
         let x = min(max(parent.frame.minX + point.x + 16, parent.frame.minX + 12), parent.frame.maxX - width - 12)
@@ -641,6 +650,7 @@ private final class NotePopup: NSObject {
         field.stringValue = initial
         field.font = .systemFont(ofSize: 16)
         super.init()
+        window.onRightClick = { [weak self] in self?.cancelPlacement() }
         let content = NSView(frame: NSRect(x: 0, y: 0, width: width, height: height))
         content.addSubview(field)
         let saveButton = NSButton(title: "Сохранить ↩", target: self, action: #selector(saveAction))
@@ -666,6 +676,10 @@ private final class NotePopup: NSObject {
     @objc private func deleteAction() {
         close()
         onDelete()
+    }
+    func cancelPlacement() {
+        if isNew { close(); onDelete() }
+        else { save() }
     }
     func save() {
         let text = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
