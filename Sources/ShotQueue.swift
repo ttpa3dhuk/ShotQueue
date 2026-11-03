@@ -104,15 +104,17 @@ private final class ShotStore {
 
     func clear() throws {
         guard !shots.isEmpty else { return }
-        let archive = root.appendingPathComponent("Archive", isDirectory: true)
-            .appendingPathComponent("\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString.prefix(6))", isDirectory: true)
-        try FileManager.default.createDirectory(at: archive, withIntermediateDirectories: true)
-        for shot in shots {
-            try FileManager.default.copyItem(at: root.appendingPathComponent(shot.file),
-                                             to: archive.appendingPathComponent(shot.file))
+        if Preferences.archiveClearedShots {
+            let archive = root.appendingPathComponent("Archive", isDirectory: true)
+                .appendingPathComponent("\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString.prefix(6))", isDirectory: true)
+            try FileManager.default.createDirectory(at: archive, withIntermediateDirectories: true)
+            for shot in shots {
+                try FileManager.default.copyItem(at: root.appendingPathComponent(shot.file),
+                                                 to: archive.appendingPathComponent(shot.file))
+            }
+            try JSONEncoder().encode(shots).write(to: archive.appendingPathComponent("session.json"), options: .atomic)
+            try markdown().write(to: archive.appendingPathComponent("session.md"), atomically: true, encoding: .utf8)
         }
-        try JSONEncoder().encode(shots).write(to: archive.appendingPathComponent("session.json"), options: .atomic)
-        try markdown().write(to: archive.appendingPathComponent("session.md"), atomically: true, encoding: .utf8)
         for shot in shots { try FileManager.default.removeItem(at: root.appendingPathComponent(shot.file)) }
         shots.removeAll()
         try saveIndex()
@@ -744,6 +746,10 @@ private func queueIcon(size: CGFloat, template: Bool = false) -> NSImage {
 }
 
 private enum Preferences {
+    static var archiveClearedShots: Bool {
+        get { UserDefaults.standard.bool(forKey: "archiveClearedShots") }
+        set { UserDefaults.standard.set(newValue, forKey: "archiveClearedShots") }
+    }
     static var brushStyle: BrushStyle {
         get {
             guard let data = UserDefaults.standard.data(forKey: "brushStyle"),
@@ -819,21 +825,25 @@ private final class SettingsPanel: NSObject, NSTextFieldDelegate {
     private let window: NSPanel
     private let confirmation: NSButton
     private let autoClear: NSButton
+    private let archive: NSButton
     private let minutes: NSTextField
     private let stepper: NSStepper
 
     override init() {
-        window = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 400, height: 200),
+        window = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 400, height: 240),
                          styleMask: [.titled, .closable], backing: .buffered, defer: false)
         confirmation = NSButton(checkboxWithTitle: "Спрашивать перед очисткой очереди", target: nil, action: nil)
         autoClear = NSButton(checkboxWithTitle: "Автоочистка", target: nil, action: nil)
+        archive = NSButton(checkboxWithTitle: "Сохранять очищенные снимки в архив", target: nil, action: nil)
         minutes = NSTextField(string: "5")
         stepper = NSStepper()
         super.init()
         window.title = "Настройки ShotQueue"
         window.isReleasedWhenClosed = false
         confirmation.target = self; confirmation.action = #selector(changeConfirmation)
-        confirmation.frame = NSRect(x: 20, y: 155, width: 360, height: 24)
+        confirmation.frame = NSRect(x: 20, y: 195, width: 360, height: 24)
+        archive.target = self; archive.action = #selector(changeArchive)
+        archive.frame = NSRect(x: 20, y: 160, width: 360, height: 24)
         autoClear.target = self; autoClear.action = #selector(changeAutoClear)
         autoClear.frame = NSRect(x: 20, y: 116, width: 145, height: 24)
         minutes.frame = NSRect(x: 170, y: 115, width: 58, height: 24)
@@ -846,16 +856,17 @@ private final class SettingsPanel: NSObject, NSTextFieldDelegate {
         stepper.setAccessibilityLabel("Минут до автоочистки")
         let unit = NSTextField(labelWithString: "мин.")
         unit.frame = NSRect(x: 260, y: 118, width: 55, height: 20)
-        let hint = NSTextField(wrappingLabelWithString: "Отсчёт идёт от последнего снимка: от 1 до 1440 минут. Автоочистка проходит без вопроса. Снимки и комментарии остаются в локальном архиве.")
+        let hint = NSTextField(wrappingLabelWithString: "Отсчёт идёт от последнего снимка: от 1 до 1440 минут. Автоочистка проходит без вопроса. Без архива снимки и комментарии удаляются при очистке.")
         hint.font = .systemFont(ofSize: 11); hint.textColor = .secondaryLabelColor
         hint.frame = NSRect(x: 22, y: 20, width: 354, height: 73)
-        for view in [confirmation, autoClear, minutes, stepper, unit, hint] {
+        for view in [confirmation, archive, autoClear, minutes, stepper, unit, hint] {
             window.contentView?.addSubview(view)
         }
         window.center()
     }
     func show() {
         confirmation.state = Preferences.confirmBeforeClearing ? .on : .off
+        archive.state = Preferences.archiveClearedShots ? .on : .off
         updateAutoClearControls()
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
@@ -869,6 +880,7 @@ private final class SettingsPanel: NSObject, NSTextFieldDelegate {
         stepper.isEnabled = Preferences.autoClearEnabled
     }
     @objc private func changeConfirmation() { Preferences.confirmBeforeClearing = confirmation.state == .on }
+    @objc private func changeArchive() { Preferences.archiveClearedShots = archive.state == .on }
     @objc private func changeAutoClear() {
         Preferences.autoClearEnabled = autoClear.state == .on
         updateAutoClearControls()
@@ -1106,13 +1118,17 @@ private func hotkeyCallback(_ next: EventHandlerCallRef?, _ event: EventRef?, _ 
         let defaults = UserDefaults.standard
         let oldEnabled = defaults.object(forKey: "autoClearEnabled")
         let oldMinutes = defaults.object(forKey: "autoClearMinutes")
+        let oldArchive = defaults.object(forKey: "archiveClearedShots")
         defer {
             if let oldEnabled { defaults.set(oldEnabled, forKey: "autoClearEnabled") }
             else { defaults.removeObject(forKey: "autoClearEnabled") }
             if let oldMinutes { defaults.set(oldMinutes, forKey: "autoClearMinutes") }
             else { defaults.removeObject(forKey: "autoClearMinutes") }
+            if let oldArchive { defaults.set(oldArchive, forKey: "archiveClearedShots") }
+            else { defaults.removeObject(forKey: "archiveClearedShots") }
         }
         Preferences.autoClearEnabled = true
+        Preferences.archiveClearedShots = true
         Preferences.autoClearMinutes = 5
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("ShotQueue-test-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1157,6 +1173,14 @@ private func hotkeyCallback(_ next: EventHandlerCallRef?, _ event: EventRef?, _ 
                   FileManager.default.fileExists(atPath: archives[0].appendingPathComponent("session.md").path) else {
                 return false
             }
+            Preferences.archiveClearedShots = false
+            try store.append(image: image, selection: NSRect(x: 0, y: 0, width: 100, height: 50),
+                             marks: [mark], screenSize: NSSize(width: 100, height: 50))
+            try store.clear()
+            guard store.shots.isEmpty,
+                  !FileManager.default.fileExists(atPath: root.appendingPathComponent("A.png").path),
+                  try FileManager.default.contentsOfDirectory(at: root.appendingPathComponent("Archive"), includingPropertiesForKeys: nil).count == 1,
+                  !store.markdown().contains("проверка") else { return false }
             return true
         } catch { return false }
     }
@@ -1303,7 +1327,9 @@ private func hotkeyCallback(_ next: EventHandlerCallRef?, _ event: EventRef?, _ 
         guard !store.shots.isEmpty, !pasting, !capturing, overlay == nil else { return }
         if Preferences.confirmBeforeClearing {
             let alert = NSAlert(); alert.messageText = "Очистить очередь из \(store.shots.count) снимков?"
-            alert.informativeText = "Предыдущая серия останется в локальном архиве ShotQueue."
+            alert.informativeText = Preferences.archiveClearedShots
+                ? "Снимки и комментарии сохранятся в локальном архиве ShotQueue."
+                : "Снимки и комментарии будут удалены."
             alert.addButton(withTitle: "Очистить"); alert.addButton(withTitle: "Отмена")
             guard alert.runModal() == .alertFirstButtonReturn else { return }
         }
