@@ -6,6 +6,7 @@ import Carbon
 import ScreenCaptureKit
 import CoreGraphics
 import ApplicationServices
+import ServiceManagement
 
 private enum MarkKind: String, Codable { case pin, rectangle, arrow, brush }
 
@@ -822,6 +823,8 @@ private final class AboutPanel: NSObject {
 }
 
 private final class SettingsPanel: NSObject, NSTextFieldDelegate {
+    private let login = NSButton(checkboxWithTitle: "Запускать при входе в macOS", target: nil, action: nil)
+    private let loginStatus = NSTextField(wrappingLabelWithString: "")
     private let window: NSPanel
     private let confirmation: NSButton
     private let autoClear: NSButton
@@ -830,7 +833,7 @@ private final class SettingsPanel: NSObject, NSTextFieldDelegate {
     private let stepper: NSStepper
 
     override init() {
-        window = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 400, height: 240),
+        window = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 400, height: 320),
                          styleMask: [.titled, .closable], backing: .buffered, defer: false)
         confirmation = NSButton(checkboxWithTitle: "Спрашивать перед очисткой очереди", target: nil, action: nil)
         autoClear = NSButton(checkboxWithTitle: "Автоочистка", target: nil, action: nil)
@@ -840,6 +843,11 @@ private final class SettingsPanel: NSObject, NSTextFieldDelegate {
         super.init()
         window.title = "Настройки ShotQueue"
         window.isReleasedWhenClosed = false
+        login.target = self; login.action = #selector(changeLogin)
+        login.frame = NSRect(x: 20, y: 275, width: 360, height: 24)
+        loginStatus.frame = NSRect(x: 22, y: 237, width: 354, height: 34)
+        loginStatus.font = .systemFont(ofSize: 11)
+        loginStatus.textColor = .secondaryLabelColor
         confirmation.target = self; confirmation.action = #selector(changeConfirmation)
         confirmation.frame = NSRect(x: 20, y: 195, width: 360, height: 24)
         archive.target = self; archive.action = #selector(changeArchive)
@@ -859,17 +867,49 @@ private final class SettingsPanel: NSObject, NSTextFieldDelegate {
         let hint = NSTextField(wrappingLabelWithString: "Отсчёт идёт от последнего снимка: от 1 до 1440 минут. Автоочистка проходит без вопроса. Без архива снимки и комментарии удаляются при очистке.")
         hint.font = .systemFont(ofSize: 11); hint.textColor = .secondaryLabelColor
         hint.frame = NSRect(x: 22, y: 20, width: 354, height: 73)
-        for view in [confirmation, archive, autoClear, minutes, stepper, unit, hint] {
+        for view in [login, loginStatus, confirmation, archive, autoClear, minutes, stepper, unit, hint] {
             window.contentView?.addSubview(view)
         }
         window.center()
     }
     func show() {
+        updateLoginControls()
         confirmation.state = Preferences.confirmBeforeClearing ? .on : .off
         archive.state = Preferences.archiveClearedShots ? .on : .off
         updateAutoClearControls()
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
+    }
+    private func updateLoginControls() {
+        let status = SMAppService.mainApp.status
+        login.state = status == .enabled || status == .requiresApproval ? .on : .off
+        switch status {
+        case .enabled: loginStatus.stringValue = "ShotQueue откроется после входа в учётную запись."
+        case .requiresApproval: loginStatus.stringValue = "Разреши запуск ShotQueue в настройках входа macOS."
+        case .notRegistered: loginStatus.stringValue = "Автозапуск выключен."
+        case .notFound: loginStatus.stringValue = "macOS не нашла приложение для автозапуска."
+        @unknown default: loginStatus.stringValue = "Не удалось определить состояние автозапуска."
+        }
+    }
+    @objc private func changeLogin() {
+        do {
+            if login.state == .on {
+                if SMAppService.mainApp.status != .requiresApproval {
+                    try SMAppService.mainApp.register()
+                }
+                if SMAppService.mainApp.status == .requiresApproval {
+                    SMAppService.openSystemSettingsLoginItems()
+                }
+            } else {
+                try SMAppService.mainApp.unregister()
+            }
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "Не удалось изменить автозапуск"
+            alert.informativeText = error.localizedDescription
+            alert.runModal()
+        }
+        updateLoginControls()
     }
     var isVisible: Bool { window.isVisible }
     private func updateAutoClearControls() {
@@ -974,6 +1014,20 @@ private func hotkeyCallback(_ next: EventHandlerCallRef?, _ event: EventRef?, _ 
 @main private final class ShotQueueApp: NSObject, NSApplicationDelegate {
     static func main() {
         let application = NSApplication.shared
+        if CommandLine.arguments.contains("--enable-login") {
+            do {
+                try SMAppService.mainApp.register()
+                print("Login item status: \(SMAppService.mainApp.status.rawValue)")
+            } catch {
+                fputs("Autostart: \(error.localizedDescription)\n", stderr)
+                exit(1)
+            }
+            return
+        }
+        if CommandLine.arguments.contains("--login-status") {
+            print("Login item status: \(SMAppService.mainApp.status.rawValue)")
+            return
+        }
         if let index = CommandLine.arguments.firstIndex(of: "--export-icon"), CommandLine.arguments.count > index + 1 {
             let directory = URL(fileURLWithPath: CommandLine.arguments[index + 1], isDirectory: true)
             try! FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
